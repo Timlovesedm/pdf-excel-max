@@ -8,20 +8,51 @@ from collections import defaultdict
 # ==========================================
 # --- ツール①：PDFからデータを抽出する関数 ---
 # ==========================================
-def extract_tables_from_multiple_pdfs(pdf_files, keywords, start_page, end_page):
+def extract_tables_from_multiple_pdfs(pdf_files, keywords, global_start, global_end, file_specific_ranges=None):
+    """
+    pdf_files: アップロードされたファイルリスト
+    keywords: 検索キーワードリスト
+    global_start: 共通開始ページ (Noneなら最初から)
+    global_end: 共通終了ページ (Noneなら最後まで)
+    file_specific_ranges: { "ファイル名": {"start": int, "end": int} } 形式の辞書
+    """
     all_rows = []
     if not keywords:
         st.error("❗ キーワードが入力されていません。", icon="🚨")
         return None
+
     for pdf_file in pdf_files:
         all_rows.append([f"ファイル名: {pdf_file.name}"])
         all_rows.append([])
+        
+        # --- ページ範囲の決定ロジック ---
+        # 個別設定があるか確認
+        current_start = global_start
+        current_end = global_end
+        
+        if file_specific_ranges and pdf_file.name in file_specific_ranges:
+            spec = file_specific_ranges[pdf_file.name]
+            # 個別設定で値が入っていればそれを採用、なければNone(全範囲)
+            current_start = spec.get("start") 
+            current_end = spec.get("end")
+
         found_in_file = False
         try:
             with pdfplumber.open(pdf_file) as pdf:
-                start_index = start_page - 1 if start_page else 0
-                end_index = end_page if end_page else len(pdf.pages)
-                target_pages = pdf.pages[start_index:end_index]
+                # ページインデックスの計算 (1始まりを0始まりに変換)
+                s_idx = (current_start - 1) if current_start else 0
+                e_idx = current_end if current_end else len(pdf.pages)
+                
+                # 範囲外エラー回避
+                s_idx = max(0, s_idx)
+                e_idx = min(len(pdf.pages), e_idx)
+                
+                if s_idx >= e_idx:
+                    st.warning(f"ファイル「{pdf_file.name}」: ページ範囲指定が無効です（開始 {current_start} ～ 終了 {current_end}）。スキップします。", icon="⚠️")
+                    continue
+
+                target_pages = pdf.pages[s_idx:e_idx]
+                
                 for page in target_pages:
                     text = page.extract_text() or ""
                     if any(kw in text for kw in keywords):
@@ -38,8 +69,9 @@ def extract_tables_from_multiple_pdfs(pdf_files, keywords, start_page, end_page)
         except Exception as e:
             st.error(f"ファイル「{pdf_file.name}」処理中にエラー: {e}", icon="🔥")
             continue
+        
         if not found_in_file:
-            st.warning(f"ファイル「{pdf_file.name}」ではキーワードを含む表が見つかりませんでした。", icon="⚠️")
+            st.warning(f"ファイル「{pdf_file.name}」では指定範囲内にキーワードを含む表が見つかりませんでした。", icon="⚠️")
 
     if not any(r for r in all_rows if r):
         return None
@@ -47,42 +79,41 @@ def extract_tables_from_multiple_pdfs(pdf_files, keywords, start_page, end_page)
 
 
 # ==========================================
-# --- ツール②：共通ユーティリティ ---
+# --- ツール②：共通ユーティリティ（強化版） ---
 # ==========================================
 
 def detect_year_header(cell_value):
-    """セル内の文字列から年次ヘッダー(YYYY, YYYYQ1, YYYY/MM等)を検出する"""
+    """セル内の文字列から年次ヘッダーを検出する"""
     cell_value = str(cell_value).strip()
-    # パターン①：「YYYYQZ」 (年+四半期) 形式
-    quarter_pat = re.compile(r"^\s*(20\d{2}Q[1-4])\s*$", re.IGNORECASE)
-    # パターン②：「(自 YYYY年MM月...」形式
-    from_date_pat = re.compile(r"\(自\s*(\d{4})年(\d{1,2})月")
-    # パターン③：「(YYYY年MM月...」または「YYYY年MM月」形式
-    date_pat = re.compile(r"\(?(\d{4})年(\d{1,2})月") 
-    # パターン④：2024 (4桁) または 202401 (6桁) の数値
-    year_pat = re.compile(r"^\s*20\d{2}(\d{2})?\s*$")
+    
+    patterns = [
+        # YYYYQ1~4
+        (re.compile(r"(20\d{2}Q[1-4])", re.IGNORECASE), lambda m: m.group(1).upper()),
+        # (自 2024年4月...
+        (re.compile(r"\(?自\s*(\d{4})年(\d{1,2})月"), lambda m: f"{m.group(1)}/{m.group(2)}"),
+        # 2024年3月期, 2024年3月 等
+        (re.compile(r"(\d{4})年(\d{1,2})月"), lambda m: f"{m.group(1)}/{m.group(2)}"),
+        # 2024年度
+        (re.compile(r"(\d{4})年度"), lambda m: f"{m.group(1)}年度"),
+        # 24/3 (YY/M) 形式
+        (re.compile(r"^\'?(\d{2})/(\d{1,2})$"), lambda m: f"20{m.group(1)}/{m.group(2)}"),
+        # 2024/3 (YYYY/M) 形式
+        (re.compile(r"(\d{4})/(\d{1,2})"), lambda m: f"{m.group(1)}/{m.group(2)}"),
+        # シンプルな数値 2024 or 202403
+        (re.compile(r"^20\d{2}(\d{2})?$"), lambda m: m.group(0))
+    ]
 
-    match_q = quarter_pat.search(cell_value)
-    match1 = from_date_pat.search(cell_value)
-    match2 = date_pat.search(cell_value)
-
-    if match_q:
-        return match_q.group(1).upper()
-    elif match1:
-        return f"{match1.group(1)}/{match1.group(2)}"
-    elif match2:
-        return f"{match2.group(1)}/{match2.group(2)}"
-    elif cell_value.isdigit() and year_pat.match(cell_value):
-        return cell_value
+    for pat, formatter in patterns:
+        match = pat.search(cell_value)
+        if match:
+            return formatter(match)
+            
     return None
 
 # ==========================================
-# --- ツール②：【縦方向】統合ロジック (既存) ---
+# --- ツール②：【縦方向】統合ロジック ---
 # ==========================================
 def tool2_extract_data_vertical(df_chunk):
-    """
-    既存のロジック: 表の中にヘッダー列があり、その下にデータがある形式
-    """
     if df_chunk.empty:
         return None, []
     
@@ -91,7 +122,6 @@ def tool2_extract_data_vertical(df_chunk):
         for c in range(df_chunk.shape[1]):
             cell_value = str(df_chunk.iat[r, c])
             year_header = detect_year_header(cell_value)
-            
             if year_header:
                 year_cells.append({"row": r, "col": c, "year_header": year_header})
 
@@ -101,10 +131,8 @@ def tool2_extract_data_vertical(df_chunk):
     year_cells.sort(key=lambda x: (x["row"], x["col"]))
     processed_years = set()
     
-    # 項目列は0列目と仮定
     initial_items = df_chunk[0].astype(str).str.strip().dropna()
     initial_items = initial_items[initial_items != ""]
-    # 「その他」重複対策
     is_sonota = initial_items == "その他"
     if is_sonota.any():
         sonota_counts = initial_items.groupby(initial_items).cumcount()
@@ -119,13 +147,12 @@ def tool2_extract_data_vertical(df_chunk):
             continue
         processed_years.add(year_header)
         val_col = cell["col"]
-        # ヘッダー行の次からデータを取得
+        
         temp_df = df_chunk.iloc[cell["row"] + 1 :, [0, val_col]].copy()
         temp_df.columns = ["共通項目", year_header]
         temp_df["共通項目"] = temp_df["共通項目"].astype(str).str.strip()
         temp_df = temp_df[temp_df["共通項目"] != ""].dropna(subset=["共通項目"])
         
-        # 重複処理
         is_sonota = temp_df["共通項目"] == "その他"
         if is_sonota.any():
             sonota_counts = temp_df.groupby("共通項目").cumcount()
@@ -140,74 +167,62 @@ def tool2_extract_data_vertical(df_chunk):
     return df_result, all_items_ordered
 
 # ==========================================
-# --- ツール②：【横方向】統合ロジック (新規) ---
+# --- ツール②：【横方向】統合ロジック ---
 # ==========================================
 def tool2_extract_data_horizontal(df_chunk):
-    """
-    新規ロジック: 
-    - 左の文字列と一番右の数値のみ統合する
-    - 項目(左) | ... | 数値(右) の形式
-    - ヘッダー(年次)はこのブロック内のどこか(主に上部)にあると仮定
-    """
     if df_chunk.empty:
         return None, []
 
-    # 1. 年次ヘッダーを探す（チャンク内の最初の数行を走査）
+    # 1. 空列の削除
+    df_clean = df_chunk.replace(r'^\s*$', pd.NA, regex=True).dropna(axis=1, how='all')
+    
+    if df_clean.shape[1] < 2:
+        return None, []
+
+    df_target = df_clean.fillna("") 
+
+    # 2. 年次ヘッダーを探す
     detected_header = None
-    for r in range(min(5, df_chunk.shape[0])): # 上から5行以内で探す
-        for c in range(df_chunk.shape[1]):
-            val = df_chunk.iat[r, c]
+    header_row_idx = -1
+    
+    for r in range(min(10, df_target.shape[0])): 
+        for c in range(df_target.shape[1]):
+            val = df_target.iat[r, c]
             header_cand = detect_year_header(val)
             if header_cand:
                 detected_header = header_cand
+                header_row_idx = r
                 break
         if detected_header:
             break
     
-    # ヘッダーが見つからない場合は、ダミーまたはファイル名依存になるが、今回はスキップ扱いにするか汎用名にする
     if not detected_header:
-        # 明示的な日付がない場合、処理不能としてNoneを返すか、あるいは強制的に取り込むか。
-        # ここでは安全のためNoneを返すが、必要に応じて "Unknown" で処理も可能
-        return None, []
+        detected_header = str(df_target.iloc[0, -1]).strip()
+        if not detected_header:
+            detected_header = "Unknown_Period"
 
-    # 2. データ抽出（左端列と右端列）
-    # 空の列を削除して、確実に端の列を取得する
-    clean_chunk = df_chunk.dropna(axis=1, how='all')
-    if clean_chunk.shape[1] < 2:
-        return None, [] # 列が足りない
-
-    item_col_idx = 0
-    val_col_idx = clean_chunk.shape[1] - 1
-
-    # データフレーム構築
-    temp_df = clean_chunk.iloc[:, [item_col_idx, val_col_idx]].copy()
+    # 3. データ抽出（一番左の列 と 一番右の列）
+    temp_df = df_target.iloc[:, [0, -1]].copy()
     temp_df.columns = ["共通項目", detected_header]
+    
+    start_row = header_row_idx + 1 if header_row_idx != -1 else 0
+    temp_df = temp_df.iloc[start_row:]
     
     # クレンジング
     temp_df["共通項目"] = temp_df["共通項目"].astype(str).str.strip()
     temp_df = temp_df[temp_df["共通項目"] != ""].dropna(subset=["共通項目"])
     
-    # 数値と思われる行のみ残す、あるいは文字列行(ヘッダーなど)を除外するフィルタ
-    # シンプルに数値変換できるか、もしくは項目名が長すぎる(文章)場合は除外するなどの処理
-    temp_df = temp_df[temp_df["共通項目"].str.len() < 50] # 仮：極端に長い項目は説明文とみなして除外
-    
-    # 数値変換
     temp_df[detected_header] = (
         pd.to_numeric(temp_df[detected_header].astype(str).str.replace(",", ""), errors='coerce')
     )
-    # 数値がNaNになった行（ヘッダー行やゴミデータ）を削除 (0埋めではなく削除)
     temp_df = temp_df.dropna(subset=[detected_header])
 
-    # 「その他」などの重複処理
     is_sonota = temp_df["共通項目"] == "その他"
     if is_sonota.any():
         sonota_counts = temp_df.groupby("共通項目").cumcount()
         temp_df.loc[is_sonota, "共通項目"] = "その他_temp_" + sonota_counts[is_sonota].astype(str)
 
-    # 同じ項目が複数行ある場合は合計する (例: 小計行などがなく単純なリストの場合)
     temp_df = temp_df.groupby("共通項目", as_index=False).sum()
-
-    # 項目リスト（順序保持用）
     item_list = temp_df["共通項目"].tolist()
 
     return temp_df, item_list
@@ -229,7 +244,6 @@ def process_files_and_tables(excel_file, integration_mode):
     file_indices = df_full[df_full[0].str.contains(r"ファイル名:", na=False)].index.tolist()
     file_chunks = []
     
-    # ファイルごとに分割
     if not file_indices:
         file_chunks.append(df_full)
     else:
@@ -241,13 +255,11 @@ def process_files_and_tables(excel_file, integration_mode):
     grouped_tables = defaultdict(list)
     master_item_order = defaultdict(list)
 
-    # 各ファイルチャンクを処理
     for file_chunk in file_chunks:
         page_indices = file_chunk[file_chunk[0].str.contains(r"--- ページ", na=False)].index.tolist()
         table_chunks = []
         last_idx = 0
         
-        # ページ/テーブルごとに分割
         if not page_indices:
             clean_chunk = file_chunk[
                 ~file_chunk[0].str.contains(r"ファイル名:|---|^\s*$", na=False, regex=True)
@@ -264,7 +276,6 @@ def process_files_and_tables(excel_file, integration_mode):
             if not final_chunk.empty:
                 table_chunks.append(final_chunk)
 
-        # 各テーブルチャンクを解析
         for i, table_chunk in enumerate(table_chunks):
             clean_table_chunk = table_chunk[
                 ~table_chunk[0].str.contains(r"ファイル名:|---", na=False, regex=True)
@@ -273,17 +284,14 @@ def process_files_and_tables(excel_file, integration_mode):
             if clean_table_chunk.empty:
                 continue
             
-            # --- モードによる分岐 ---
             if integration_mode == "vertical":
                 processed_df, item_order = tool2_extract_data_vertical(clean_table_chunk.reset_index(drop=True))
             else: # horizontal
                 processed_df, item_order = tool2_extract_data_horizontal(clean_table_chunk.reset_index(drop=True))
-            # -----------------------
 
             if processed_df is not None and not processed_df.empty:
                 grouped_tables[i].append(processed_df)
                 
-                # マスタ項目の順序を更新（和集合を作成しつつ順序維持）
                 current_master_order = master_item_order[i]
                 if not current_master_order:
                     master_item_order[i].extend(item_order)
@@ -293,11 +301,9 @@ def process_files_and_tables(excel_file, integration_mode):
                         if item in current_master_order:
                             last_known_index = current_master_order.index(item)
                         else:
-                            # 新出項目は直前の既知項目の後ろに挿入
                             current_master_order.insert(last_known_index + 1, item)
                             last_known_index += 1
 
-    # 最終マージ処理
     final_summaries = []
     for table_index in sorted(grouped_tables.keys()):
         list_of_dfs = grouped_tables[table_index]
@@ -309,7 +315,6 @@ def process_files_and_tables(excel_file, integration_mode):
         result_df = pd.DataFrame({"共通項目": ordered_items})
         
         for df_to_merge in list_of_dfs:
-            # 既に存在する列名と重複しないようにマージ
             cols_to_drop = [
                 col for col in df_to_merge.columns if col in result_df.columns and col != "共通項目"
             ]
@@ -319,19 +324,23 @@ def process_files_and_tables(excel_file, integration_mode):
             
         result_df.fillna(0, inplace=True)
         
-        # 列のソート (YYYY/MM, YYYY, YYYYQZ 対応)
+        def sort_key(col_name):
+            s = str(col_name).upper().replace('/', '').replace('Q', '0').replace('年度', '').replace('年', '').replace('月', '')
+            digits = "".join(filter(str.isdigit, s))
+            if digits:
+                return int(digits.ljust(6, '0'))
+            return 99999999
+
         year_cols = sorted(
             [col for col in result_df.columns if col != "共通項目"],
-            key=lambda x: int(str(x).upper().replace('/', '').replace('Q', '0').ljust(6, '0'))
+            key=sort_key
         )
         final_cols = ["共通項目"] + year_cols
         result_df = result_df[final_cols]
         
-        # 数値整形
         for col in year_cols:
-            result_df[col] = pd.to_numeric(result_df[col], errors='coerce').fillna(0).astype(int) # 整数表示
+            result_df[col] = pd.to_numeric(result_df[col], errors='coerce').fillna(0).astype(int)
             
-        # 一時的な項目名（_temp_数字）を元に戻す
         result_df["共通項目"] = result_df["共通項目"].str.replace(r"_temp_\d+$", "", regex=True)
         
         final_summaries.append(result_df)
@@ -352,18 +361,56 @@ with st.container(border=True):
         "PDFファイルをアップロード（複数可）", type="pdf", accept_multiple_files=True
     )
     keyword_input_str = st.text_input("検索キーワード（カンマ区切り）")
-    col1, col2 = st.columns(2)
-    start_page_input = col1.text_input("開始ページ", placeholder="例: 5")
-    end_page_input = col2.text_input("終了ページ", placeholder="例: 10")
+    
+    st.subheader("ページ範囲設定")
+    # 設定モードの選択
+    range_mode = st.radio(
+        "範囲設定モード", 
+        ("全てのファイルで同じ範囲にする", "ファイルごとに範囲を指定する"),
+        index=0
+    )
+    
+    global_start = None
+    global_end = None
+    file_specific_ranges = {}
+
+    if range_mode == "全てのファイルで同じ範囲にする":
+        col1, col2 = st.columns(2)
+        s_in = col1.text_input("開始ページ (共通)", placeholder="例: 5")
+        e_in = col2.text_input("終了ページ (共通)", placeholder="例: 10")
+        if s_in.isdigit(): global_start = int(s_in)
+        if e_in.isdigit(): global_end = int(e_in)
+        
+    else:
+        st.info("各ファイルの開始・終了ページを入力してください（空欄の場合は全ページが対象になります）")
+        if pdf_files:
+            for i, f in enumerate(pdf_files):
+                c1, c2, c3 = st.columns([4, 1, 1])
+                c1.write(f"📄 **{f.name}**")
+                s_in = c2.text_input("開始", key=f"start_{i}_{f.name}", placeholder="1")
+                e_in = c3.text_input("終了", key=f"end_{i}_{f.name}", placeholder="Last")
+                
+                s_val = int(s_in) if s_in.isdigit() else None
+                e_val = int(e_in) if e_in.isdigit() else None
+                
+                # 辞書に保存
+                file_specific_ranges[f.name] = {"start": s_val, "end": e_val}
+        else:
+            st.warning("まずはファイルをアップロードしてください。")
+
     if st.button("抽出開始 ▶️"):
         if pdf_files:
             keywords = [kw.strip() for kw in keyword_input_str.split(",") if kw.strip()]
-            start_page = int(start_page_input) if start_page_input.isdigit() else None
-            end_page = int(end_page_input) if end_page_input.isdigit() else None
+            
             with st.spinner("PDF解析中..."):
+                # 以前の引数 start_page, end_page の代わりに global_start, global_end と specific_ranges を渡す
                 df_result = extract_tables_from_multiple_pdfs(
-                    pdf_files, keywords, start_page, end_page
+                    pdf_files, keywords, 
+                    global_start=global_start, 
+                    global_end=global_end,
+                    file_specific_ranges=file_specific_ranges
                 )
+                
                 if df_result is not None and not df_result.empty:
                     st.success("抽出完了！", icon="✅")
                     st.dataframe(df_result)
@@ -399,21 +446,17 @@ with st.container(border=True):
     st.header("ツール②：統合データ作成")
     
     st.info("📝 データの並び方を選択してください")
-    # ラジオボタンでモード選択
     integration_mode_label = st.radio(
         "統合モード選択",
         ("縦方向統合 (従来の形式)", "横方向統合 (項目:左 / 数値:右)"),
         help="データが縦に積み上がっている場合は「縦方向」、横並びの年次データを結合する場合は「横方向」を選択してください"
     )
-    
-    # 内部ロジック用のフラグ変換
     integration_mode = "vertical" if "縦方向" in integration_mode_label else "horizontal"
     
     excel_file = st.file_uploader("Excelファイルをアップロード", type=["xlsx"])
     
     if st.button("統合まとめ表を作成 ▶️", disabled=(excel_file is None)):
         with st.spinner("データ整理中..."):
-            # 選択されたモードを関数に渡す
             all_summaries = process_files_and_tables(excel_file, integration_mode)
             
             if all_summaries:
@@ -423,9 +466,8 @@ with st.container(border=True):
                     for i, summary_df in enumerate(all_summaries):
                         sheet_name = f"統合まとめ表_{i+1}"
                         summary_df.to_excel(writer, sheet_name=sheet_name, index=False)
-                        # 列幅調整などの簡易フォーマット
                         worksheet = writer.sheets[sheet_name]
-                        worksheet.set_column(0, 0, 30) # 項目列を広げる
+                        worksheet.set_column(0, 0, 30)
 
                 base_name_input = excel_file.name.rsplit('.xlsx', 1)[0]
                 mode_suffix = "_縦統合" if integration_mode == "vertical" else "_横統合"
@@ -442,4 +484,4 @@ with st.container(border=True):
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
             else:
-                st.warning("有効なデータが見つかりませんでした。モードやファイルを確認してください。", icon="⚠️")
+                st.warning("有効なデータが見つかりませんでした。（ヘッダー未検出、または空列の問題の可能性があります）", icon="⚠️")
